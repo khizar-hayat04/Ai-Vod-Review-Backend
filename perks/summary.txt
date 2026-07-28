@@ -1,0 +1,16 @@
+Valorant Round Extraction Summary (detection only — no clips)
+=============================================================
+Video        : D:\test_Deaths.mp4
+Total rounds : 7
+Team wins    : 3
+Enemy wins   : 4
+Final score  : 3 - 4
+Time         : 123.2s
+
+Round 01: team   00:00 -> 01:00
+Round 02: team   01:00 -> 03:00
+Round 03: team   03:00 -> 03:30
+Round 04: enemy  03:00 -> 03:30
+Round 05: enemy  03:00 -> 03:30
+Round 06: enemy  03:00 -> 03:30
+Round 07: enemy  03:00 -> 03:30

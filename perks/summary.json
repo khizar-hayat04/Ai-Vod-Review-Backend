@@ -1,0 +1,97 @@
+{
+  "video": "D:\\test_Deaths.mp4",
+  "total_rounds": 7,
+  "team_wins": 3,
+  "enemy_wins": 4,
+  "final_score": {
+    "team": 3,
+    "enemy": 4
+  },
+  "timing_sec": 123.24,
+  "rounds": [
+    {
+      "round": 1,
+      "winner": "team",
+      "start_sec": 0,
+      "end_sec": 60,
+      "start": "00:00",
+      "end": "01:00",
+      "score_after": {
+        "team": 1,
+        "enemy": 0
+      }
+    },
+    {
+      "round": 2,
+      "winner": "team",
+      "start_sec": 60,
+      "end_sec": 180,
+      "start": "01:00",
+      "end": "03:00",
+      "score_after": {
+        "team": 2,
+        "enemy": 0
+      }
+    },
+    {
+      "round": 3,
+      "winner": "team",
+      "start_sec": 180,
+      "end_sec": 210,
+      "start": "03:00",
+      "end": "03:30",
+      "score_after": {
+        "team": 3,
+        "enemy": 4
+      }
+    },
+    {
+      "round": 4,
+      "winner": "enemy",
+      "start_sec": 180,
+      "end_sec": 210,
+      "start": "03:00",
+      "end": "03:30",
+      "score_after": {
+        "team": 3,
+        "enemy": 4
+      }
+    },
+    {
+      "round": 5,
+      "winner": "enemy",
+      "start_sec": 180,
+      "end_sec": 210,
+      "start": "03:00",
+      "end": "03:30",
+      "score_after": {
+        "team": 3,
+        "enemy": 4
+      }
+    },
+    {
+      "round": 6,
+      "winner": "enemy",
+      "start_sec": 180,
+      "end_sec": 210,
+      "start": "03:00",
+      "end": "03:30",
+      "score_after": {
+        "team": 3,
+        "enemy": 4
+      }
+    },
+    {
+      "round": 7,
+      "winner": "enemy",
+      "start_sec": 180,
+      "end_sec": 210,
+      "start": "03:00",
+      "end": "03:30",
+      "score_after": {
+        "team": 3,
+        "enemy": 4
+      }
+    }
+  ]
+}
