@@ -25,8 +25,17 @@ if load_dotenv:
 app = Flask(__name__)
 CORS(app, resources={r'/api/*': {'origins': '*'}})
 
-UPLOAD_ROOT = BASE_DIR / 'uploads'
-UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+# Vercel serverless only allows writes under /tmp; local keeps ./uploads.
+if os.environ.get('VERCEL'):
+    UPLOAD_ROOT = Path('/tmp/uploads')
+else:
+    UPLOAD_ROOT = BASE_DIR / 'uploads'
+
+try:
+    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+except OSError as exc:  # pragma: no cover — e.g. unexpected read-only path
+    # Defer hard failure to upload handlers; avoid crashing app import.
+    app.logger.warning('Could not create UPLOAD_ROOT at %s: %s', UPLOAD_ROOT, exc)
 
 SESSION_ID_PATTERN = re.compile(
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$'
