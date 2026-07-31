@@ -7,7 +7,7 @@ alter table public.sessions alter column session_type set default 'live';
 alter table public.sessions alter column session_type set not null;
 alter table public.sessions drop constraint if exists sessions_session_type_check;
 alter table public.sessions add constraint sessions_session_type_check
-  check (session_type in ('live', 'solo_recording'));
+  check (session_type in ('live', 'solo_recording', 'stream_review'));
 
 alter table public.sessions alter column player_id drop not null;
 

@@ -11,7 +11,7 @@ create table if not exists public.explanations (
   duration_seconds double precision null,
   -- Optional short label shown on markers / review list.
   title text null,
-  -- Uploaded audio URL (Flask /api/sessions/.../explanations/audio/...).
+  -- Uploaded audio URL (Supabase Storage explanation-audio bucket public URL).
   audio_url text null,
   -- Buffered draw events: [{ relativeTimeMs, type, tool?, color?, points? }, ...]
   draw_events jsonb not null default '[]'::jsonb,

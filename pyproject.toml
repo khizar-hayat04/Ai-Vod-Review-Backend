@@ -1,13 +1,15 @@
 [project]
-name = "ai-vod-review-backend"
+name = "elusive-backend"
 version = "0.1.0"
-description = "Flask backend for AI VOD Review"
+description = "Flask backend for Elusive"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "flask>=3.0.0",
     "requests>=2.31.0",
-    "flask-cors>=4.0.0"
+    "flask-cors>=4.0.0",
+    "supabase>=2.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [tool.vercel]

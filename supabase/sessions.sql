@@ -33,10 +33,19 @@ alter table public.sessions alter column session_type set default 'live';
 alter table public.sessions alter column session_type set not null;
 alter table public.sessions drop constraint if exists sessions_session_type_check;
 alter table public.sessions add constraint sessions_session_type_check
-  check (session_type in ('live', 'solo_recording'));
+  check (session_type in ('live', 'solo_recording', 'stream_review'));
 
 -- Solo Path B has no player until a share link is opened later.
 alter table public.sessions alter column player_id drop not null;
+
+-- Video length, captured once when the VOD first loads in Review Mode.
+alter table public.sessions add column if not exists duration_seconds numeric;
+
+-- Soft-hide from workspace lists (player/coach independently).
+alter table public.sessions
+  add column if not exists hidden_from_player boolean not null default false;
+alter table public.sessions
+  add column if not exists hidden_from_coach boolean not null default false;
 
 -- Allow 'reviewing' on existing databases (constraint name may vary).
 alter table public.sessions drop constraint if exists sessions_status_check;
@@ -69,6 +78,18 @@ create policy "sessions_select_participants"
     or (player_id is null and status = 'uploading')
   );
 
+-- Additive SELECT for unclaimed stream_review links (status=live, no player yet).
+drop policy if exists "sessions_select_unclaimed_stream_review" on public.sessions;
+create policy "sessions_select_unclaimed_stream_review"
+  on public.sessions
+  for select
+  to authenticated
+  using (
+    session_type = 'stream_review'
+    and status = 'live'
+    and player_id is null
+  );
+
 -- INSERT: coaches create sessions for themselves.
 drop policy if exists "sessions_insert_coach" on public.sessions;
 create policy "sessions_insert_coach"
@@ -89,6 +110,34 @@ create policy "sessions_update_participants"
     or (player_id is null and status = 'uploading')
   )
   with check (
+    auth.uid() = coach_id
+    or auth.uid() = player_id
+  );
+
+-- Additive UPDATE: first opener claims player_id on an unclaimed stream_review.
+drop policy if exists "sessions_update_claim_stream_review" on public.sessions;
+create policy "sessions_update_claim_stream_review"
+  on public.sessions
+  for update
+  to authenticated
+  using (
+    session_type = 'stream_review'
+    and status = 'live'
+    and player_id is null
+  )
+  with check (
+    session_type = 'stream_review'
+    and status = 'live'
+    and auth.uid() = player_id
+  );
+
+-- DELETE: coach or claimed player can remove a past session from their workspace.
+drop policy if exists "sessions_delete_participants" on public.sessions;
+create policy "sessions_delete_participants"
+  on public.sessions
+  for delete
+  to authenticated
+  using (
     auth.uid() = coach_id
     or auth.uid() = player_id
   );

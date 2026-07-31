@@ -1,1 +1,8 @@
 uploads
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+supabase/
+perks/
