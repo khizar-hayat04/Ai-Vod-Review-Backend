@@ -640,21 +640,8 @@ def cache_age_seconds(fetched_at: Any) -> Optional[float]:
     return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 
-@app.get('/api/players/<player_id>/valorant-stats')
-def get_valorant_stats(player_id: str):
-    """Valorant stats for one player, cached for an hour.
-
-    Reads the Riot ID with the service role because RLS hides
-    player_game_accounts rows from every client except the player themselves.
-    """
-    if not UUID_PATTERN.fullmatch(player_id):
-        abort(400, description='Invalid player id')
-
-    try:
-        client = get_supabase()
-    except RuntimeError as exc:
-        return jsonify({'error': str(exc)}), 503
-
+def build_valorant_stats_payload(client: Client, player_id: str) -> Dict[str, Any]:
+    """Resolve Valorant stats for a player (service-role). Same shape as the HTTP route."""
     try:
         account_rows = (
             client.table('player_game_accounts')
@@ -666,22 +653,22 @@ def get_valorant_stats(player_id: str):
         ).data or []
     except Exception as exc:  # noqa: BLE001
         app.logger.exception('Riot ID lookup failed for player=%s', player_id)
-        return jsonify({'error': f'Could not read the linked Riot ID: {exc}'}), 502
+        raise RuntimeError(f'Could not read the linked Riot ID: {exc}') from exc
 
     handle = (account_rows[0].get('handle') if account_rows else '') or ''
     if not handle.strip():
-        return jsonify({'linked': False})
+        return {'linked': False}
 
     riot_id = split_riot_id(handle)
     if not riot_id:
         app.logger.warning(
             'Player %s has a Riot ID that is not Name#Tag: %r', player_id, handle
         )
-        return jsonify({
+        return {
             'linked': True,
             'available': False,
             'reason': 'The saved Riot ID is not in Name#Tag form.',
-        })
+        }
 
     cached = None
     try:
@@ -696,13 +683,13 @@ def get_valorant_stats(player_id: str):
             player_id,
             int(age),
         )
-        return jsonify({
+        return {
             'linked': True,
             'available': True,
             'cached': True,
             'fetched_at': cached.get('fetched_at'),
             **(cached.get('stats') or {}),
-        })
+        }
 
     app.logger.info(
         'Valorant stats cache MISS player=%s age=%s; calling provider',
@@ -716,18 +703,18 @@ def get_valorant_stats(player_id: str):
         app.logger.warning('Valorant stats unavailable for player=%s: %s', player_id, exc)
         # Stale beats empty: show the old numbers rather than a dead panel.
         if cached and cached.get('stats'):
-            return jsonify({
+            return {
                 'linked': True,
                 'available': True,
                 'cached': True,
                 'stale': True,
                 'fetched_at': cached.get('fetched_at'),
                 **cached['stats'],
-            })
-        return jsonify({'linked': True, 'available': False, 'reason': str(exc)})
+            }
+        return {'linked': True, 'available': False, 'reason': str(exc)}
     except Exception as exc:  # noqa: BLE001
         app.logger.exception('Valorant stats fetch crashed for player=%s', player_id)
-        return jsonify({'linked': True, 'available': False, 'reason': str(exc)})
+        return {'linked': True, 'available': False, 'reason': str(exc)}
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     fetched_at = datetime.now(timezone.utc).isoformat()
@@ -746,12 +733,659 @@ def get_valorant_stats(player_id: str):
         riot_id[1],
         elapsed_ms,
     )
-    return jsonify({
+    return {
         'linked': True,
         'available': True,
         'cached': False,
         'fetched_at': fetched_at,
         **stats,
+    }
+
+
+def _baseline_exists(client: Client, coach_id: str, player_id: str) -> bool:
+    rows = (
+        client.table('coach_student_baselines')
+        .select('coach_id')
+        .eq('coach_id', coach_id)
+        .eq('player_id', player_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    return bool(rows)
+
+
+def _count_pair_sessions(client: Client, coach_id: str, player_id: str) -> int:
+    res = (
+        client.table('sessions')
+        .select('id', count='exact')
+        .eq('coach_id', coach_id)
+        .eq('player_id', player_id)
+        .execute()
+    )
+    if res.count is not None:
+        return int(res.count)
+    return len(res.data or [])
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_numeric(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (number == number):  # NaN
+        return None
+    return number
+
+
+def try_capture_baseline(
+    client: Client,
+    coach_id: str,
+    player_id: str,
+    *,
+    only_if_single_session: bool,
+) -> Dict[str, Any]:
+    """Insert a fixed baseline for a coach–player pair when missing.
+
+    Never overwrites an existing row. Skips silently when the player has no
+    linked Valorant account or stats cannot be resolved.
+    """
+    try:
+        if _baseline_exists(client, coach_id, player_id):
+            return {'captured': False, 'reason': 'already_exists'}
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception(
+            'Baseline exists-check failed coach=%s player=%s', coach_id, player_id
+        )
+        return {'captured': False, 'reason': f'lookup_failed: {exc}'}
+
+    try:
+        session_count = _count_pair_sessions(client, coach_id, player_id)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception(
+            'Baseline session-count failed coach=%s player=%s', coach_id, player_id
+        )
+        return {'captured': False, 'reason': f'session_lookup_failed: {exc}'}
+
+    if session_count < 1:
+        return {'captured': False, 'reason': 'no_session'}
+    if only_if_single_session and session_count != 1:
+        return {'captured': False, 'reason': 'not_first_session'}
+
+    try:
+        payload = build_valorant_stats_payload(client, player_id)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception(
+            'Baseline Valorant fetch failed coach=%s player=%s', coach_id, player_id
+        )
+        return {'captured': False, 'reason': f'stats_failed: {exc}'}
+
+    if not payload.get('linked'):
+        return {'captured': False, 'reason': 'not_linked'}
+    if not payload.get('available'):
+        return {'captured': False, 'reason': 'stats_unavailable'}
+
+    rank = payload.get('rank') or {}
+    perf = payload.get('performance') or {}
+    row = {
+        'coach_id': coach_id,
+        'player_id': player_id,
+        'rank_tier': _coerce_int(rank.get('tier_id')),
+        'rr': _coerce_int(rank.get('rr')),
+        'kd': _coerce_numeric(perf.get('kd')),
+        'win_rate': _coerce_numeric(perf.get('win_rate')),
+        'headshot_pct': _coerce_numeric(perf.get('headshot_pct')),
+    }
+
+    try:
+        client.table('coach_student_baselines').insert(row).execute()
+    except Exception as exc:  # noqa: BLE001 — race on PK → treat as already captured
+        message = str(exc).lower()
+        if 'duplicate' in message or 'unique' in message or '23505' in message:
+            return {'captured': False, 'reason': 'already_exists'}
+        app.logger.exception(
+            'Baseline insert failed coach=%s player=%s', coach_id, player_id
+        )
+        return {'captured': False, 'reason': f'insert_failed: {exc}'}
+
+    app.logger.info(
+        'Baseline captured coach=%s player=%s rank_tier=%s kd=%s',
+        coach_id,
+        player_id,
+        row.get('rank_tier'),
+        row.get('kd'),
+    )
+    return {'captured': True, 'baseline': row}
+
+
+@app.post('/api/baselines/ensure')
+def ensure_baseline():
+    """Capture a baseline for one coach–player pair if this is their first session."""
+    body = request.get_json(silent=True) or {}
+    coach_id = str(body.get('coach_id') or '').strip()
+    player_id = str(body.get('player_id') or '').strip()
+
+    if not coach_id or not UUID_PATTERN.fullmatch(coach_id):
+        return jsonify({'error': 'Valid coach_id is required'}), 400
+    if not player_id or not UUID_PATTERN.fullmatch(player_id):
+        return jsonify({'error': 'Valid player_id is required'}), 400
+
+    try:
+        client = get_supabase()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+
+    result = try_capture_baseline(
+        client, coach_id, player_id, only_if_single_session=True
+    )
+    return jsonify(result)
+
+
+@app.post('/api/baselines/backfill-player')
+def backfill_player_baselines():
+    """After a player links Riot ID, capture baselines for coach pairs still missing one."""
+    body = request.get_json(silent=True) or {}
+    player_id = str(body.get('player_id') or '').strip()
+
+    if not player_id or not UUID_PATTERN.fullmatch(player_id):
+        return jsonify({'error': 'Valid player_id is required'}), 400
+
+    try:
+        client = get_supabase()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+
+    try:
+        session_rows = (
+            client.table('sessions')
+            .select('coach_id')
+            .eq('player_id', player_id)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Baseline backfill session list failed player=%s', player_id)
+        return jsonify({'error': f'Could not list sessions: {exc}'}), 502
+
+    coach_ids = sorted({
+        str(row['coach_id']).strip()
+        for row in session_rows
+        if row.get('coach_id') and UUID_PATTERN.fullmatch(str(row['coach_id']).strip())
+    })
+
+    results = []
+    captured = 0
+    for coach_id in coach_ids:
+        outcome = try_capture_baseline(
+            client, coach_id, player_id, only_if_single_session=False
+        )
+        if outcome.get('captured'):
+            captured += 1
+        results.append({'coachId': coach_id, **outcome})
+
+    return jsonify({
+        'playerId': player_id,
+        'coachCount': len(coach_ids),
+        'capturedCount': captured,
+        'results': results,
+    })
+
+
+# HenrikDev competitive tier ids → display labels (Iron 1 … Radiant).
+VALORANT_TIER_NAMES: Dict[int, str] = {
+    0: 'Unranked',
+    3: 'Iron 1',
+    4: 'Iron 2',
+    5: 'Iron 3',
+    6: 'Bronze 1',
+    7: 'Bronze 2',
+    8: 'Bronze 3',
+    9: 'Silver 1',
+    10: 'Silver 2',
+    11: 'Silver 3',
+    12: 'Gold 1',
+    13: 'Gold 2',
+    14: 'Gold 3',
+    15: 'Platinum 1',
+    16: 'Platinum 2',
+    17: 'Platinum 3',
+    18: 'Diamond 1',
+    19: 'Diamond 2',
+    20: 'Diamond 3',
+    21: 'Ascendant 1',
+    22: 'Ascendant 2',
+    23: 'Ascendant 3',
+    24: 'Immortal 1',
+    25: 'Immortal 2',
+    26: 'Immortal 3',
+    27: 'Radiant',
+}
+
+
+def _tier_label(tier_id: Optional[int], fallback_name: Optional[str] = None) -> Optional[str]:
+    if fallback_name and str(fallback_name).strip():
+        return str(fallback_name).strip()
+    if tier_id is None:
+        return None
+    return VALORANT_TIER_NAMES.get(int(tier_id), f'Tier {tier_id}')
+
+
+def build_coach_improvement(client: Client, coach_id: str) -> Dict[str, Any]:
+    """Aggregate rank-up stats vs baselines for one coach.
+
+    Y = students with a baseline row. X = those whose current tier_id > baseline.
+    Graph entries are only positive proof points (tier improved), sorted by delta.
+    """
+    try:
+        baseline_rows = (
+            client.table('coach_student_baselines')
+            .select(
+                'player_id, rank_tier, rr, kd, win_rate, headshot_pct, captured_at'
+            )
+            .eq('coach_id', coach_id)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Improvement baselines failed coach=%s', coach_id)
+        raise RuntimeError(f'Could not load baselines: {exc}') from exc
+
+    player_ids = [
+        str(row['player_id'])
+        for row in baseline_rows
+        if row.get('player_id') and UUID_PATTERN.fullmatch(str(row['player_id']))
+    ]
+
+    name_by_id: Dict[str, str] = {}
+    if player_ids:
+        try:
+            profile_rows = (
+                client.table('profiles')
+                .select('id, display_name')
+                .in_('id', player_ids)
+                .execute()
+            ).data or []
+            for prow in profile_rows:
+                pid = str(prow.get('id') or '')
+                if pid:
+                    name_by_id[pid] = (prow.get('display_name') or '').strip() or 'Student'
+        except Exception:  # noqa: BLE001 — names are optional for public
+            app.logger.exception('Improvement name lookup failed coach=%s', coach_id)
+
+    students_with_baseline = len(baseline_rows)
+    ranked_up = 0
+    improved: List[Dict[str, Any]] = []
+
+    for row in baseline_rows:
+        player_id = str(row.get('player_id') or '')
+        if not player_id:
+            continue
+
+        baseline_tier = _coerce_int(row.get('rank_tier'))
+        try:
+            payload = build_valorant_stats_payload(client, player_id)
+        except Exception:  # noqa: BLE001
+            app.logger.exception(
+                'Improvement Valorant fetch failed coach=%s player=%s',
+                coach_id,
+                player_id,
+            )
+            continue
+
+        if not payload.get('linked') or not payload.get('available'):
+            continue
+
+        rank = payload.get('rank') or {}
+        perf = payload.get('performance') or {}
+        current_tier = _coerce_int(rank.get('tier_id'))
+        if baseline_tier is None or current_tier is None:
+            continue
+
+        if current_tier > baseline_tier:
+            ranked_up += 1
+            delta = current_tier - baseline_tier
+            improved.append({
+                'playerId': player_id,
+                'displayName': name_by_id.get(player_id, 'Student'),
+                'baselineRankTier': baseline_tier,
+                'currentRankTier': current_tier,
+                'rankDelta': delta,
+                'baselineRankLabel': _tier_label(baseline_tier),
+                'currentRankLabel': _tier_label(
+                    current_tier, rank.get('tier') if isinstance(rank.get('tier'), str) else None
+                ),
+                'baselineKd': _coerce_numeric(row.get('kd')),
+                'currentKd': _coerce_numeric(perf.get('kd')),
+                'baselineWinRate': _coerce_numeric(row.get('win_rate')),
+                'currentWinRate': _coerce_numeric(perf.get('win_rate')),
+                'baselineRr': _coerce_int(row.get('rr')),
+                'currentRr': _coerce_int(rank.get('rr')),
+            })
+
+    improved.sort(
+        key=lambda item: (
+            -int(item.get('rankDelta') or 0),
+            -int(item.get('currentRankTier') or 0),
+        )
+    )
+
+    return {
+        'studentsWithBaseline': students_with_baseline,
+        'studentsRankedUp': ranked_up,
+        'headline': (
+            f'{ranked_up} of {students_with_baseline} students ranked up '
+            f'while training with this coach'
+            if students_with_baseline > 0
+            else 'No baseline stats captured yet'
+        ),
+        'improved': improved,
+    }
+
+
+def _coach_workspace_counts(client: Client, coach_id: str) -> Dict[str, int]:
+    """Distinct students + session count for reviewing/completed (not hidden from coach)."""
+    try:
+        session_rows = (
+            client.table('sessions')
+            .select('id, player_id')
+            .eq('coach_id', coach_id)
+            .in_('status', ['reviewing', 'completed'])
+            .eq('hidden_from_coach', False)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Coach session counts failed coach=%s', coach_id)
+        raise RuntimeError(f'Could not load sessions: {exc}') from exc
+
+    player_ids = {
+        str(row['player_id'])
+        for row in session_rows
+        if row.get('player_id')
+    }
+    return {
+        'totalStudents': len(player_ids),
+        'totalSessions': len(session_rows),
+    }
+
+
+@app.get('/api/coaches/<coach_id>/public-profile')
+def get_coach_public_profile(coach_id: str):
+    """Public coach card — bio/games, counts, anonymized improvement proof points."""
+    if not UUID_PATTERN.fullmatch(coach_id):
+        abort(400, description='Invalid coach id')
+
+    try:
+        client = get_supabase()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+
+    try:
+        profile_rows = (
+            client.table('profiles')
+            .select('id, display_name, role, bio, games, coach_status')
+            .eq('id', coach_id)
+            .limit(1)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Public coach profile lookup failed coach=%s', coach_id)
+        return jsonify({'error': f'Could not load profile: {exc}'}), 502
+
+    if not profile_rows:
+        return jsonify({'error': 'Coach not found'}), 404
+
+    profile = profile_rows[0]
+    if (profile.get('role') or '').lower() != 'coach':
+        return jsonify({'error': 'Coach not found'}), 404
+
+    try:
+        counts = _coach_workspace_counts(client, coach_id)
+        improvement = build_coach_improvement(client, coach_id)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    # Public graphs: top 5 improvers, anonymous labels only.
+    public_graphs = []
+    for index, item in enumerate((improvement.get('improved') or [])[:5]):
+        label = f'Student {chr(ord("A") + index)}'
+        public_graphs.append({
+            'label': label,
+            'baselineRankTier': item.get('baselineRankTier'),
+            'currentRankTier': item.get('currentRankTier'),
+            'rankDelta': item.get('rankDelta'),
+            'baselineRankLabel': item.get('baselineRankLabel'),
+            'currentRankLabel': item.get('currentRankLabel'),
+            'baselineKd': item.get('baselineKd'),
+            'currentKd': item.get('currentKd'),
+            'baselineWinRate': item.get('baselineWinRate'),
+            'currentWinRate': item.get('currentWinRate'),
+        })
+
+    games = profile.get('games') or []
+    if not isinstance(games, list):
+        games = []
+
+    return jsonify({
+        'coachId': coach_id,
+        'displayName': (profile.get('display_name') or '').strip() or 'Coach',
+        'bio': (profile.get('bio') or '').strip() or None,
+        'games': [str(g) for g in games if g],
+        'coachStatus': profile.get('coach_status'),
+        'totalStudents': counts['totalStudents'],
+        'totalSessions': counts['totalSessions'],
+        'studentsWithBaseline': improvement['studentsWithBaseline'],
+        'studentsRankedUp': improvement['studentsRankedUp'],
+        'headline': improvement['headline'],
+        'improvedGraphs': public_graphs,
+    })
+
+
+@app.get('/api/coaches/<coach_id>/improvement')
+def get_coach_improvement(coach_id: str):
+    """Named improvement stats for the coach's own workspace dashboard."""
+    if not UUID_PATTERN.fullmatch(coach_id):
+        abort(400, description='Invalid coach id')
+
+    try:
+        client = get_supabase()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+
+    try:
+        profile_rows = (
+            client.table('profiles')
+            .select('id, role')
+            .eq('id', coach_id)
+            .limit(1)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Coach improvement profile lookup failed coach=%s', coach_id)
+        return jsonify({'error': f'Could not load profile: {exc}'}), 502
+
+    if not profile_rows or (profile_rows[0].get('role') or '').lower() != 'coach':
+        return jsonify({'error': 'Coach not found'}), 404
+
+    try:
+        improvement = build_coach_improvement(client, coach_id)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 502
+
+    return jsonify(improvement)
+
+
+@app.get('/api/players/<player_id>/valorant-stats')
+def get_valorant_stats(player_id: str):
+    """Valorant stats for one player, cached for an hour.
+
+    Reads the Riot ID with the service role because RLS hides
+    player_game_accounts rows from every client except the player themselves.
+    """
+    if not UUID_PATTERN.fullmatch(player_id):
+        abort(400, description='Invalid player id')
+
+    try:
+        client = get_supabase()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+
+    try:
+        return jsonify(build_valorant_stats_payload(client, player_id))
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 502
+
+
+@app.get('/api/players/<player_id>/public-profile')
+def get_public_profile(player_id: str):
+    """Public-safe player card data — no auth required.
+
+    Aggregates only: display name, session stats, endorsement counts,
+    featured testimonials, verified flag, and Valorant summary. Never returns
+    email, private notes, or unfeatured testimonials.
+    """
+    if not UUID_PATTERN.fullmatch(player_id):
+        abort(400, description='Invalid player id')
+
+    try:
+        client = get_supabase()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 503
+
+    try:
+        profile_rows = (
+            client.table('profiles')
+            .select('id, display_name, role')
+            .eq('id', player_id)
+            .limit(1)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Public profile lookup failed for player=%s', player_id)
+        return jsonify({'error': f'Could not load profile: {exc}'}), 502
+
+    if not profile_rows:
+        return jsonify({'error': 'Player not found'}), 404
+
+    profile = profile_rows[0]
+    if (profile.get('role') or '').lower() != 'player':
+        return jsonify({'error': 'Player not found'}), 404
+
+    display_name = (profile.get('display_name') or '').strip() or 'Player'
+
+    try:
+        session_rows = (
+            client.table('sessions')
+            .select('created_at, duration_seconds')
+            .eq('player_id', player_id)
+            .in_('status', ['reviewing', 'completed'])
+            .eq('hidden_from_player', False)
+            .order('created_at', desc=False)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Public profile sessions failed for player=%s', player_id)
+        return jsonify({'error': f'Could not load sessions: {exc}'}), 502
+
+    training_seconds = 0.0
+    for row in session_rows:
+        try:
+            duration = float(row.get('duration_seconds') or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration > 0:
+            training_seconds += duration
+
+    training_since = session_rows[0].get('created_at') if session_rows else None
+
+    try:
+        endorsement_rows = (
+            client.table('player_endorsements')
+            .select('tag')
+            .eq('player_id', player_id)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Public profile endorsements failed for player=%s', player_id)
+        return jsonify({'error': f'Could not load endorsements: {exc}'}), 502
+
+    skill_counts: Counter[str] = Counter()
+    for row in endorsement_rows:
+        tag = (row.get('tag') or '').strip()
+        if tag:
+            skill_counts[tag] += 1
+    top_skills = [
+        {'tag': tag, 'count': count}
+        for tag, count in skill_counts.most_common(5)
+    ]
+
+    try:
+        testimonial_rows = (
+            client.table('player_testimonials')
+            .select('id, text, created_at, coach:profiles!coach_id(display_name)')
+            .eq('player_id', player_id)
+            .eq('is_featured', True)
+            .order('created_at', desc=True)
+            .limit(3)
+            .execute()
+        ).data or []
+    except Exception as exc:  # noqa: BLE001
+        app.logger.exception('Public profile testimonials failed for player=%s', player_id)
+        return jsonify({'error': f'Could not load testimonials: {exc}'}), 502
+
+    featured = []
+    for row in testimonial_rows:
+        coach = row.get('coach')
+        if isinstance(coach, list):
+            coach = coach[0] if coach else None
+        coach_name = ''
+        if isinstance(coach, dict):
+            coach_name = (coach.get('display_name') or '').strip()
+        featured.append({
+            'id': row.get('id'),
+            'text': row.get('text') or '',
+            'coachName': coach_name or 'Coach',
+            'createdAt': row.get('created_at'),
+        })
+
+    verified = False
+    try:
+        account_rows = (
+            client.table('player_game_accounts')
+            .select('verified')
+            .eq('player_id', player_id)
+            .eq('game', 'valorant')
+            .limit(1)
+            .execute()
+        ).data or []
+        if account_rows:
+            verified = bool(account_rows[0].get('verified'))
+    except Exception:  # noqa: BLE001 — verified is optional on the card
+        app.logger.exception('Public profile verified lookup failed for player=%s', player_id)
+
+    valorant: Dict[str, Any] = {'linked': False}
+    try:
+        valorant = build_valorant_stats_payload(client, player_id)
+    except Exception:  # noqa: BLE001 — card still works without Valorant
+        app.logger.exception('Public profile Valorant failed for player=%s', player_id)
+
+    return jsonify({
+        'playerId': player_id,
+        'displayName': display_name,
+        'sessionCount': len(session_rows),
+        'trainingSeconds': training_seconds,
+        'trainingSince': training_since,
+        'verified': verified,
+        'topSkills': top_skills,
+        'featuredTestimonials': featured,
+        'valorant': valorant,
     })
 
 
@@ -853,6 +1487,221 @@ def cluster_mistakes():
 
     groups = cluster_mistake_texts(cleaned, threshold=0.6, min_count=min_count)
     return jsonify({'groups': groups})
+
+
+RECURRING_LOOKBACK = 5
+# Scan this many prior sessions when hunting for ones that actually have notes
+# (recent empty sessions must not hide older recurring mistakes).
+RECURRING_SCAN_LIMIT = 40
+RECURRING_THRESHOLD = 0.6
+# Include live so an in-progress prior session with notes still counts; current
+# session is always excluded by id.
+WORKSPACE_SESSION_STATUSES = ('live', 'reviewing', 'completed')
+
+
+def _match_text_against_history(
+    text: str,
+    historical: List[Dict[str, Any]],
+    threshold: float = RECURRING_THRESHOLD,
+) -> Dict[str, Any]:
+    """Match one note text against prior-session mistake rows.
+
+    historical entries: {text, session_id, session_number, session_date}
+    """
+    normalized = _normalize_mistake_text(text)
+    empty = {
+        'recurring': False,
+        'label': normalized,
+        'prior_sessions': [],
+        'prior_session_count': 0,
+    }
+    if not normalized:
+        return empty
+
+    matched_by_session: Dict[str, Dict[str, Any]] = {}
+    label_counts: Counter = Counter()
+
+    for row in historical:
+        hist_text = _normalize_mistake_text(row.get('text'))
+        if not hist_text:
+            continue
+        if _similarity(normalized, hist_text) < threshold:
+            continue
+        session_id = str(row.get('session_id') or '')
+        if not session_id or session_id in matched_by_session:
+            if session_id:
+                label_counts[hist_text] += 1
+            continue
+        matched_by_session[session_id] = {
+            'session_id': session_id,
+            'session_number': row.get('session_number'),
+            'session_date': row.get('session_date') or '',
+        }
+        label_counts[hist_text] += 1
+
+    if not matched_by_session:
+        return empty
+
+    label = label_counts.most_common(1)[0][0] if label_counts else normalized
+    prior_sessions = sorted(
+        matched_by_session.values(),
+        key=lambda s: (s.get('session_number') is None, s.get('session_number') or 0),
+    )
+    return {
+        'recurring': True,
+        'label': label,
+        'prior_sessions': prior_sessions,
+        'prior_session_count': len(prior_sessions),
+    }
+
+
+def _load_prior_mistake_history(
+    *,
+    coach_id: str,
+    player_id: str,
+    current_session_id: str,
+) -> List[Dict[str, Any]]:
+    """Mistake notes from up to the last N prior sessions that have mistakes.
+
+    Empty recent sessions are skipped so older recurring notes still surface.
+    Session numbers use the full coach–player history (oldest = Session 1).
+    """
+    client = get_supabase()
+    result = (
+        client.table('sessions')
+        .select('id, created_at, status')
+        .eq('coach_id', coach_id)
+        .eq('player_id', player_id)
+        .in_('status', list(WORKSPACE_SESSION_STATUSES))
+        .order('created_at', desc=True)
+        .execute()
+    )
+    rows = list(result.data or [])
+
+    # Oldest = Session 1 across the full history (workspace convention).
+    oldest_first = list(reversed(rows))
+    number_by_id = {
+        str(row['id']): index + 1
+        for index, row in enumerate(oldest_first)
+        if row.get('id')
+    }
+
+    prior_candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        sid = str(row.get('id') or '')
+        if not sid or sid == current_session_id:
+            continue
+        prior_candidates.append(row)
+        if len(prior_candidates) >= RECURRING_SCAN_LIMIT:
+            break
+
+    if not prior_candidates:
+        print(
+            f'[recurring-check] no prior sessions coach={coach_id[:8]} '
+            f'player={player_id[:8]} current={current_session_id[:8]}'
+        )
+        return []
+
+    candidate_ids = [str(row['id']) for row in prior_candidates if row.get('id')]
+    notes_result = (
+        client.table('session_notes')
+        .select('session_id, text, video_timestamp')
+        .eq('category', 'mistake')
+        .in_('session_id', candidate_ids)
+        .execute()
+    )
+
+    notes_by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for note in notes_result.data or []:
+        text = _normalize_mistake_text(note.get('text'))
+        if not text:
+            continue
+        session_id = str(note.get('session_id') or '')
+        if not session_id:
+            continue
+        notes_by_session.setdefault(session_id, []).append(note)
+
+    # Newest-first candidates; keep only sessions that have mistake text, up to lookback.
+    selected_ids: List[str] = []
+    for row in prior_candidates:
+        sid = str(row['id'])
+        if sid not in notes_by_session:
+            continue
+        selected_ids.append(sid)
+        if len(selected_ids) >= RECURRING_LOOKBACK:
+            break
+
+    date_by_id = {
+        str(row['id']): row.get('created_at') or '' for row in prior_candidates
+    }
+    historical: List[Dict[str, Any]] = []
+    for session_id in selected_ids:
+        for note in notes_by_session.get(session_id, []):
+            text = _normalize_mistake_text(note.get('text'))
+            if not text:
+                continue
+            historical.append({
+                'text': text,
+                'session_id': session_id,
+                'session_number': number_by_id.get(session_id),
+                'session_date': date_by_id.get(session_id, ''),
+            })
+
+    print(
+        f'[recurring-check] coach={coach_id[:8]} player={player_id[:8]} '
+        f'candidates={len(candidate_ids)} with_notes={len(notes_by_session)} '
+        f'selected={len(selected_ids)} hist_notes={len(historical)}'
+    )
+    return historical
+
+
+@app.post('/api/mistakes/recurring-check')
+def recurring_mistake_check():
+    """Fuzzy-match note text(s) against prior coach–player mistake history."""
+    body = request.get_json(silent=True) or {}
+    coach_id = str(body.get('coach_id') or '').strip()
+    player_id = str(body.get('player_id') or '').strip()
+    current_session_id = str(body.get('current_session_id') or '').strip()
+
+    if not coach_id or not UUID_PATTERN.fullmatch(coach_id):
+        return jsonify({'error': 'Valid coach_id is required'}), 400
+    if not player_id or not UUID_PATTERN.fullmatch(player_id):
+        return jsonify({'error': 'Valid player_id is required'}), 400
+    if not current_session_id or not UUID_PATTERN.fullmatch(current_session_id):
+        return jsonify({'error': 'Valid current_session_id is required'}), 400
+
+    texts_raw = body.get('texts')
+    single_text = body.get('text')
+    texts: List[str] = []
+    if isinstance(texts_raw, list):
+        texts = [str(t) for t in texts_raw if t is not None and str(t).strip()]
+    elif single_text is not None and str(single_text).strip():
+        texts = [str(single_text)]
+    else:
+        return jsonify({'error': 'Body must include "text" or a non-empty "texts" array'}), 400
+
+    try:
+        historical = _load_prior_mistake_history(
+            coach_id=coach_id,
+            player_id=player_id,
+            current_session_id=current_session_id,
+        )
+    except Exception as exc:  # pragma: no cover
+        print(f'[recurring-check] history load failed: {exc}')
+        return jsonify({'error': 'Failed to load session history'}), 500
+
+    if len(texts) == 1 and not isinstance(texts_raw, list):
+        match = _match_text_against_history(texts[0], historical)
+        print(
+            f'[recurring-check] text={texts[0]!r:.40} recurring={match["recurring"]} '
+            f'prior={match["prior_session_count"]}'
+        )
+        return jsonify(match)
+
+    matches: Dict[str, Any] = {}
+    for text in texts:
+        matches[text] = _match_text_against_history(text, historical)
+    return jsonify({'matches': matches})
 
 
 if __name__ == '__main__':
